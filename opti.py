@@ -224,6 +224,7 @@ if __name__ == '__main__':
         
         _F_fixed=F.interpolate(_F_fixed, align_corners=True, size=(size,size), mode="bilinear")
         _F_moving=F.interpolate(_F_moving, align_corners=True, size=(size,size), mode="bilinear")
+        _bbox=lm["bbox"].to(torch.float).to(device)
         
         field = torch.randn(1, 2, size, size, device=device, requires_grad=True)
         
@@ -249,9 +250,10 @@ if __name__ == '__main__':
             
             diff=(warped_moving- F_fixed)*sim_map
             
-            loss = F.mse_loss(diff, torch.zeros_like(diff))
+            loss_f = F.mse_loss(diff, torch.zeros_like(diff))
+            loss_m = F.mse_loss(_warped_moving*_bbox, _F_fixed)
         
-            loss = 1*loss+Grad().loss(field)*configs['smooth_weight']+1*F.mse_loss(_warped_moving, _F_fixed)
+            loss = 1*loss_f+Grad().loss(field)*configs['smooth_weight']+1*loss_m
         
             loss.backward()
             optimizer.step()
@@ -272,7 +274,6 @@ if __name__ == '__main__':
         resize1 = ResizeTransform(sc,2)
         resize1 = resize1.to(device)
         
-        ebd_disp=resize1(disp)
         grid_identity = create_identity_grid(configs['h'], configs['w'])
         
         displacement_norm = torch.stack([
