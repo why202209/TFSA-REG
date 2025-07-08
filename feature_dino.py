@@ -26,11 +26,13 @@ if __name__ == '__main__':
         "model_name":"dinov2_vitl14"
         }
     
+    sc=5
+    
     dino_extractor = VitExtractor(model_name=config['model_name'], device=device, stride=config['stride'])
     dino_extractor = dino_extractor.eval().to(device)
 
     @torch.no_grad()
-    def get_ebd_image(image, model_name=config['model_name'], facet='tokens', mode='moving', layer=None, device: str = 'cuda:0'):
+    def get_ebd_image(image, model_name=config['model_name'], facet='tokens', layer=None, device: str = 'cuda:0'):
         
         imagenet_norm = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         ph = dino_extractor.get_height_patch_num(image[[0]].shape)
@@ -69,8 +71,8 @@ if __name__ == '__main__':
                 _moving=load_image(f"{pth}/moving.jpg",device,config['h']*sc,config['w']*sc)
                 _fixed=load_image(f"{pth}/fixed.jpg",device,config['h']*sc,config['w']*sc)
             
-                dino_ebd_f=get_ebd_image(_fixed,mode='fixed')
-                dino_ebd_m=get_ebd_image(_moving,mode='moving')
+                dino_ebd_f=get_ebd_image(_fixed)
+                dino_ebd_m=get_ebd_image(_moving)
                 
                 dino_ebd_pth=os.path.join(pth,"dino_ebd")
                 os.makedirs(dino_ebd_pth, exist_ok=True)
