@@ -1,14 +1,14 @@
 # TFSA-REG
 
-Data directory structure:\n
--data\n
-    -{index}\n
-        -fixed.jpg\n
-        -moving.jpg\n
-        -temp.jpg\n
-        -dino_ebd\n
-            -fixed_ebd.pt\n
-            -moving_ebd.pt\n
+Data directory structure:  
+-data  
+    -{index}  
+        -fixed.jpg  
+        -moving.jpg  
+        -temp.jpg  
+        -dino_ebd  
+            -fixed_ebd.pt  
+            -moving_ebd.pt  
         -mask.pt
 
 SAM:
