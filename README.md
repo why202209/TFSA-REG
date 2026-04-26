@@ -12,4 +12,4 @@ Data directory structure:
         -mask.pt
 
 SAM3:
-https://github.com/facebookresearch/segment-anything.git](https://github.com/facebookresearch/sam3.git
+https://github.com/facebookresearch/sam3.git
