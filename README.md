@@ -11,5 +11,5 @@ Data directory structure:
             -moving_ebd.pt  
         -mask.pt
 
-SAM:
-https://github.com/facebookresearch/segment-anything.git
+SAM3:
+https://github.com/facebookresearch/segment-anything.git](https://github.com/facebookresearch/sam3.git
