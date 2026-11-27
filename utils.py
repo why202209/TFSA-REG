@@ -8,6 +8,28 @@ import gc
 from einops import rearrange
 from PIL import Image
 import numpy as np
+from pathlib import Path
+
+
+def registration_samples(data_root, prefix=None):
+    """Find README-style numeric sample folders and legacy split folders."""
+    samples = []
+    for folder in Path(data_root).iterdir():
+        if not folder.is_dir():
+            continue
+        if not all((folder / name).is_file() for name in ("fixed.jpg", "moving.jpg")):
+            continue
+        split, separator, index = folder.name.partition("_")
+        if folder.name.isdecimal():
+            samples.append((int(folder.name), folder))
+        elif (
+            separator
+            and split in ("train", "val")
+            and index.isdecimal()
+            and (prefix is None or prefix == split)
+        ):
+            samples.append((int(index), folder))
+    return [folder for _, folder in sorted(samples)]
 
 
 def attn_cosine_sim(x, eps=1e-08):
@@ -102,7 +124,7 @@ class VitExtractor(nn.Module):
         for block_idx, block in enumerate(self.model.blocks):
             if block_idx in self.layers_dict[VitExtractor.BLOCK_KEY]:
                 self.hook_handlers.append(block.register_forward_hook(self._get_block_hook()))
-            if block_idx in self.layers_dict[VitExtractor.ATTN_KEY]:
+            if block_idx in self.layers_dict[VitExtractor.ATTN_KEY] and isinstance(block.attn.attn_drop, nn.Module):
                 self.hook_handlers.append(block.attn.attn_drop.register_forward_hook(self._get_attn_hook()))
             if block_idx in self.layers_dict[VitExtractor.QKV_KEY]:
                 self.hook_handlers.append(block.attn.qkv.register_forward_hook(self._get_qkv_hook()))
@@ -320,11 +342,13 @@ def get_dino_features_video(video, model_name="dinov2_vitb14", facet='tokens', s
     gc.collect()
     return dino_features_video
 
-def load_image(imfile, device="cpu", resize_h=None, resize_w=None):
-    img_pil = Image.open(imfile)
-    if resize_h is not None:
-        img_pil = img_pil.resize((resize_w, resize_h), Image.LANCZOS)
-    img = np.array(img_pil).astype(np.uint8)
+def load_image(imfile, device="cpu", resize_h=None, resize_w=None, rgb=False):
+    with Image.open(imfile) as img_pil:
+        if rgb:
+            img_pil = img_pil.convert("RGB")
+        if resize_h is not None:
+            img_pil = img_pil.resize((resize_w, resize_h), Image.Resampling.LANCZOS)
+        img = np.array(img_pil, dtype=np.uint8)
     
     if len(img.shape) == 2:
         img = torch.from_numpy(img).float().unsqueeze(0)

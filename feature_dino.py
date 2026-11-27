@@ -1,84 +1,88 @@
+import argparse
+from pathlib import Path
+
 import torch
-from torch import nn
-import os
-import numpy as np
-import torch.nn.functional as F
-from tqdm import tqdm
-import math
-import time
-from utils import load_image,VitExtractor
-import torchvision.transforms as T
+from einops import rearrange
 from PIL import Image
+from torchvision.transforms import Normalize
+from tqdm import tqdm
 
-if __name__ == '__main__':
+from utils import VitExtractor, load_image, registration_samples
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    image_path = "./data"   
 
-    config={
-        "num":888,
-        "h":196,
-        "w":196,
-        
-        "facet":"tokens",
-        "stride":14,
-        "layer":None,
-        "model_name":"dinov2_vitl14"
+@torch.inference_mode()
+def extract_features(extractor, path, size, facet, layer, device):
+    image = load_image(path, device, *size, rgb=True)
+    height = extractor.get_height_patch_num(image.shape)
+    width = extractor.get_width_patch_num(image.shape)
+    if min(height, width) < 2:
+        raise ValueError(f"{path}: increase --size or --gamma to get at least two patches per axis")
+
+    # Keep all complete patches when the upscaled image has a partial patch at an edge.
+    patch_size = extractor.get_patch_size()
+    image = image[..., :height * patch_size, :width * patch_size]
+    image = Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(image)
+
+    if facet == "tokens" and hasattr(extractor.model, "get_intermediate_layers"):
+        tokens, = extractor.model.get_intermediate_layers(image, n=[layer], norm=False)
+    else:
+        methods = {
+            "tokens": extractor.get_feature_from_input,
+            "keys": extractor.get_keys_from_input,
+            "queries": extractor.get_queries_from_input,
+            "values": extractor.get_values_from_input,
         }
-    
-    sc=5
-    
-    dino_extractor = VitExtractor(model_name=config['model_name'], device=device, stride=config['stride'])
-    dino_extractor = dino_extractor.eval().to(device)
+        tokens = methods[facet](image, layers=[layer])[:, 1:]
+    return rearrange(tokens, "b (h w) c -> b c h w", h=height, w=width).cpu()
 
-    @torch.no_grad()
-    def get_ebd_image(image, model_name=config['model_name'], facet='tokens', layer=None, device: str = 'cuda:0'):
-        
-        imagenet_norm = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-        ph = dino_extractor.get_height_patch_num(image[[0]].shape)
-        pw = dino_extractor.get_width_patch_num(image[[0]].shape)
-        dino_embedding_dim = dino_extractor.get_embedding_dim(model_name)
-        n_layers = dino_extractor.get_n_layers()
-        layers = [n_layers - 9] if layer is None else [layer]
 
-        dino_features_video = torch.zeros(size=(image.shape[0], dino_embedding_dim, ph, pw), device='cpu')
-        for i in range(image.shape[0]):
-            dino_input = imagenet_norm(image[[i]]).to(device)
-            if facet == "keys":
-                features = dino_extractor.get_keys_from_input(dino_input, layers=layers)
-            elif facet == "queries":
-                features = dino_extractor.get_queries_from_input(dino_input, layers=layers)
-            elif facet == "values":
-                features = dino_extractor.get_values_from_input(dino_input, layers=layers)
-            elif facet == "tokens":
-                features = dino_extractor.get_feature_from_input(dino_input, layers=layers) # T (HxW + 1) x C
-            else:
-                raise ValueError(f"facet {facet} not supported")
-            features = rearrange(features[:, 1:, :], "heads (ph pw) ch -> (ch heads) ph pw", ph=ph, pw=pw)
-            dino_features_video[i] = features.cpu()
-        
-        return dino_features_video.to(device)
-                    
-    with tqdm(total=config['num'],position=0) as pbar:
-            pbar.set_description('Processing:')
-            for index in range(config['num']):
-                
-                pth=os.path.join(image_path,f"{index}")
-                moving=load_image(f"{pth}/moving.jpg",device,config['h'],config['w'])
-                fixed=load_image(f"{pth}/fixed.jpg",device,config['h'],config['w'])
-                temp=load_image(f"{pth}/temp.jpg",device,config['h'],config['w'])
-            
-                _moving=load_image(f"{pth}/moving.jpg",device,config['h']*sc,config['w']*sc)
-                _fixed=load_image(f"{pth}/fixed.jpg",device,config['h']*sc,config['w']*sc)
-            
-                dino_ebd_f=get_ebd_image(_fixed)
-                dino_ebd_m=get_ebd_image(_moving)
-                
-                dino_ebd_pth=os.path.join(pth,"dino_ebd")
-                os.makedirs(dino_ebd_pth, exist_ok=True)
-                torch.save(dino_ebd_f.cpu(),dino_ebd_pth+"/fixed_ebd.pt")
-                print(f"Saved {dino_ebd_pth}, shape: {dino_ebd_f.shape}")
-                torch.save(dino_ebd_m.cpu(),dino_ebd_pth+"/moving_ebd.pt")
-                print(f"Saved {dino_ebd_pth}, shape: {dino_ebd_m.shape}")
-                
-                pbar.update(1)
+def main():
+    parser = argparse.ArgumentParser(description="Cache pretrained DINOv2 features for each image pair.")
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--size", type=int, nargs=2, metavar=("HEIGHT", "WIDTH"))
+    parser.add_argument("--gamma", type=int, default=5)
+    parser.add_argument("--model", default="dinov2_vitl14", choices=(
+        "dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"
+    ))
+    parser.add_argument("--facet", default="tokens", choices=("tokens", "keys", "queries", "values"))
+    parser.add_argument("--layer", type=int, help="Zero-based layer. Defaults to the ninth layer from the end.")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--split", choices=("train", "val"), default="val")
+    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+    if args.gamma < 1 or (args.size and min(args.size) < 2):
+        parser.error("Use gamma >= 1 and image axes of at least two pixels.")
+
+    samples = registration_samples(args.data_root, prefix=args.split)[:args.limit]
+    if not samples:
+        parser.error(f"No registration samples in {args.data_root}")
+    extractor = VitExtractor(model_name=args.model, device=args.device, stride=14).eval()
+    layers = extractor.get_n_layers()
+    layer = layers - 9 if args.layer is None else args.layer
+    if not 0 <= layer < layers:
+        parser.error(f"The layer must be between 0 and {layers - 1}.")
+
+    for folder in tqdm(samples, desc="Extracting DINOv2 features"):
+        paths = (folder / "fixed.jpg", folder / "moving.jpg")
+        size = args.size
+        if size is None:
+            sizes = []
+            for path in paths:
+                with Image.open(path) as image:
+                    sizes.append((image.height, image.width))
+            if sizes[0] != sizes[1]:
+                raise ValueError(f"{folder}: fixed and moving sizes differ. Supply --size to resize both.")
+            size = sizes[0]
+        upscaled_size = tuple(axis * args.gamma for axis in size)
+        features = [
+            extract_features(extractor, path, upscaled_size, args.facet, layer, args.device)
+            for path in paths
+        ]
+        directory = folder / "dino_ebd"
+        directory.mkdir(exist_ok=True)
+        for path, feature in zip(paths, features):
+            torch.save(feature, directory / f"{path.stem}_ebd.pt")
+
+
+if __name__ == "__main__":
+    main()

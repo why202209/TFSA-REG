@@ -1,298 +1,184 @@
+import argparse
+from pathlib import Path
+
 import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-import os
-import numpy as np
 import torch.nn.functional as F
-from tqdm import tqdm
-import math
-import time
 from PIL import Image
-from base import SpatialTransformer,ResizeTransform,pca_lowrank_transform
-from utils import load_image,VitExtractor
-import torchvision.transforms as T
-from einops import rearrange
-import matplotlib.pyplot as plt
-import cv2
-from torchvision.transforms.functional import gaussian_blur
-        
-def get_transform(img_size=(224, 224)):
+from tqdm import tqdm
 
-    return T.Compose([
-        T.Resize(img_size),
-        T.ToTensor(),
-        #T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-class Grad:
-    """
-    N-D gradient loss.
-    """
+from base import pca_lowrank_transform
+from utils import load_image, registration_samples
 
-    def __init__(self, penalty='l1', loss_mult=None):
-        self.penalty = penalty
-        self.loss_mult = loss_mult
 
-    def loss(self, y_pred):
-        dy = torch.abs(y_pred[:, :, 1:, :] - y_pred[:, :, :-1, :])
-        dx = torch.abs(y_pred[:, :, :, 1:] - y_pred[:, :, :, :-1])
-
-        if self.penalty == 'l2':
-            dy = dy * dy
-            dx = dx * dx
-
-        d = torch.mean(dx) + torch.mean(dy)
-        grad = d / 2.0
-
-        if self.loss_mult is not None:
-            grad *= self.loss_mult
-        return grad
-
-class ImageRegistrationDataset(Dataset):
-    def __init__(self, data_root, transform=None, flag=1, limit=888):
-
-        self.data_root = data_root
-        self.transform = transform if transform is not None else T.ToTensor()
-        
-        self.limit=limit
-        
-        if flag!=0:
-            self.sample_folders = sorted(
-                [d for d in os.listdir(data_root) if d.startswith('train_')],
-                key=lambda x: int(x.split('_')[1])
-            )        
-        else:
-            self.sample_folders = sorted(
-                [d for d in os.listdir(data_root) if d.startswith('val_')],
-                key=lambda x: int(x.split('_')[1])
-            )
-        
-    def __len__(self):
-    
-        return min(self.limit, len(self.sample_folders))
-    
-    def __getitem__(self, idx):
-    
-        folder_name = self.sample_folders[idx]
-        folder_path = os.path.join(self.data_root, folder_name)
-        
-        moving_img = Image.open(os.path.join(folder_path, 'moving.jpg'))
-        fixed_img = Image.open(os.path.join(folder_path, 'fixed.jpg'))
-        
-        temp=Image.open(os.path.join(folder_path, 'temp.jpg'))
-        
-        if self.transform:
-            moving_img = self.transform(moving_img)
-            fixed_img = self.transform(fixed_img)
-            
-            temp = self.transform(temp)
-        
-        feature_path = os.path.join(folder_path, 'dino_ebd')
-        moving_feat = torch.load(os.path.join(feature_path, 'moving_ebd.pt')).squeeze()
-        fixed_feat = torch.load(os.path.join(feature_path, 'fixed_ebd.pt')).squeeze()
-        
-        return {
-            'moving_img': moving_img,
-            'fixed_img': fixed_img,
-            'moving_feat': moving_feat,
-            'fixed_feat': fixed_feat,
-            'folder_name': folder_name,
-            
-            'temp':temp  
-        }
-
-def create_dataloaders(val_root, batch_size=32, num_workers=4, img_size=(224, 224), limit=888):
-
-    transform = get_transform(img_size)
-    
-    val_dataset = ImageRegistrationDataset(val_root, transform=transform, flag=0, limit=limit)
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,    
-        #prefetch_factor=20,
-        #multiprocessing_context=multiprocessing.get_context('spawn')
-    )
-    
-    return val_loader
-    
-def plot_deformed_grid(flow_field, grid_step=20, index=0):
-
-    print(flow_field.shape)
-
-    h, w, _ = flow_field.shape
-    grid_x, grid_y = np.meshgrid(np.linspace(0, w, w//grid_step), 
-                                np.linspace(0, h, h//grid_step))
-    
-    deformed_x = grid_x + flow_field[::grid_step, ::grid_step, 0]
-    deformed_y = grid_y + flow_field[::grid_step, ::grid_step, 1]
-    
-    plt.figure(figsize=(10,10))
-    plt.plot(grid_x, grid_y, 'k-', linewidth=0.5)
-    plt.plot(grid_x.T, grid_y.T, 'k-', linewidth=0.5)
-    plt.plot(deformed_x, deformed_y, 'r-', linewidth=1)
-    plt.plot(deformed_x.T, deformed_y.T, 'r-', linewidth=1)
-    plt.gca().invert_yaxis()
-    plt.title("Grid Deformation Visualization")
-    
-    plt.savefig(f"./disp_{index}.png")
-    plt.show()
-    
-    plt.close()
-    
-def create_identity_grid(height, width):
-    y, x = torch.meshgrid(
-        torch.linspace(-1, 1, height, device=device),
-        torch.linspace(-1, 1, width, device=device),
-        indexing='ij'
-    )
-    grid = torch.stack((x, y), dim=2)  
-    return grid.unsqueeze(0)
-    
 def spatial_cosine_similarity(tensor1, tensor2, eps=1e-8, eta=0):
+    similarity = F.cosine_similarity(tensor1, tensor2, dim=1, eps=eps)
+    return (similarity > eta).unsqueeze(1)
 
-    tensor1_norm = F.normalize(tensor1, p=2, dim=1)  
-    tensor2_norm = F.normalize(tensor2, p=2, dim=1)  
-    
-    similarity = (tensor1_norm * tensor2_norm).sum(dim=1, keepdim=True)  
-    
-    similarity = torch.clamp(similarity, -1.0 + eps, 1.0 - eps)
-    
-    binary_mask = (similarity > eta).float()
-    
-    return binary_mask#similarity  
-        
-if __name__ == '__main__':
-    image_path = "./data"
-    out_path = "./output"
 
-    configs={
-        "num":888,
-        "h":196,
-        "w":196,
+def manifold_alignment(warped, fixed, confidence):
+    """Squared Frobenius difference of the retained patches' cosine matrices."""
+    source = F.normalize(warped.flatten(2).transpose(1, 2), dim=-1)
+    target = F.normalize(fixed.flatten(2).transpose(1, 2), dim=-1)
+    keep = confidence.flatten(2).transpose(1, 2).to(source.dtype)
 
-        'smooth_weight' : 35, 
-        'lr' : 3,
-        'num_iter' : 500
-    }
+    # SS^T - TT^T = MD^T + DM^T, where M=(S+T)/2 and D=S-T.
+    # Contract in channel space to include all retained pairs without P-by-P matrices.
+    midpoint = (source + target) * (keep * 0.5)
+    difference = (source - target) * keep
+    midpoint_t = midpoint.transpose(1, 2)
+    difference_t = difference.transpose(1, 2)
+    cross = midpoint_t @ difference
+    squared = (midpoint_t @ midpoint) * (difference_t @ difference)
+    squared = 2 * (squared.sum() + (cross * cross.transpose(1, 2)).sum())
+    return squared.clamp_min(0)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    
-    loss_func=torch.nn.MSELoss()
-        
-    loss_val=[]
-    loss_test=[]
-        
-    val_loader=create_dataloaders(image_path, batch_size=1, num_workers=0, img_size=(configs['h'], configs['w']), limit=configs['num'])
-        
-    for index, batch in enumerate(tqdm(val_loader,total=len(val_loader),position=0)):
-    
-        moving_imgs = batch['moving_img'].to(device)
-        fixed_imgs = batch['fixed_img'].to(device)
-        dino_ebd_m = batch['moving_feat'].to(device)
-        dino_ebd_f = batch['fixed_feat'].to(device)
-        folder_name = batch['folder_name']
-        
-        temp = batch['temp'].to(device)
-        
-        me_in=rearrange(dino_ebd_m,"a b c d -> (a c d) b")
-        fe_in=rearrange(dino_ebd_f,"a b c d -> (a c d) b")
-        pca_in=torch.concat([fe_in,me_in],dim=0)
-        
-        n_components=256
-        size=dino_ebd_f.shape[-1]
-        sc=configs['h']/size
 
-        reduced_patches, eigenvalues = pca_lowrank_transform(pca_in, n_components)
+def sampling_grid(flow):
+    """Target-to-source sampling coordinates for a pixel-space (x, y) field."""
+    height, width = flow.shape[-2:]
+    y, x = torch.meshgrid(
+        torch.arange(height, device=flow.device, dtype=flow.dtype),
+        torch.arange(width, device=flow.device, dtype=flow.dtype),
+        indexing="ij",
+    )
+    identity = torch.stack((x, y), dim=-1)
+    scale = flow.new_tensor((width - 1, height - 1)).clamp_min(1)
+    return 2 * (identity + flow.permute(0, 2, 3, 1)) / scale - 1
 
-        _moving_ebd = reduced_patches[size*size:, :]
-        _fixed_ebd = reduced_patches[:size*size, :]
 
-        F_moving = _moving_ebd.reshape([1,size,size,n_components]).permute(0,3,1,2)
-        F_fixed = _fixed_ebd.reshape([1,size,size,n_components]).permute(0,3,1,2)
-        print(dino_ebd_m.shape)
-        
-        lm=torch.load(f"data/{index}/mask.pt")
-            
-        _F_fixed=lm["mask1"].to(torch.float).to(device)
-        _F_moving=lm["mask2"].to(torch.float).to(device)
-        
-        print(_F_fixed.shape)
-        
-        _F_fixed=F.interpolate(_F_fixed, align_corners=True, size=(size,size), mode="bilinear")
-        _F_moving=F.interpolate(_F_moving, align_corners=True, size=(size,size), mode="bilinear")
-        _bbox=lm["bbox"].to(torch.float).to(device)
-        
-        field = torch.randn(1, 2, size, size, device=device, requires_grad=True)
-        
-        optimizer = torch.optim.Adam([field], lr=configs['lr'])
-        
-        grid_identity = create_identity_grid(size, size)
+def warp(image, grid, mode="bilinear"):
+    return F.grid_sample(image, grid, mode=mode, padding_mode="border", align_corners=True)
 
-        for i in range(configs['num_iter']):
-            optimizer.zero_grad()
-        
-            displacement_norm = torch.stack([
-                field[:, 0, :, :] / (size / 2),
-                field[:, 1, :, :] / (size / 2)
-            ], dim=-1)  
-        
-            sampling_grid = grid_identity + displacement_norm  
-        
-            warped_moving = F.grid_sample(F_moving, sampling_grid, align_corners=True, mode='bilinear', padding_mode='border')
-            
-            _warped_moving = F.grid_sample(_F_moving, sampling_grid, align_corners=True, mode='bilinear', padding_mode='border')
-            
-            sim_map = spatial_cosine_similarity(warped_moving, F_fixed)
-            
-            diff=(warped_moving- F_fixed)*sim_map
-            
-            loss_f = F.mse_loss(diff, torch.zeros_like(diff))
-            loss_m = F.mse_loss(_warped_moving*_bbox, _F_fixed)
-        
-            loss = 1*loss_f+Grad().loss(field)*configs['smooth_weight']+1*loss_m
-        
-            loss.backward()
-            optimizer.step()
-        
-            if (i+1) % 500 == 0:
-                print(f"Iter {i+1}, Loss: {loss.item():.6f}")
-        
-        resize = ResizeTransform(1/sc,2)
-        resize = resize.to(device)
-        
-        _disp=resize(field)
-        
-        disp = torch.stack([
-            gaussian_blur(_disp[:, 0], kernel_size=5, sigma=3.0),
-            gaussian_blur(_disp[:, 1], kernel_size=5, sigma=3.0)
-        ], dim=1)
-        
-        resize1 = ResizeTransform(sc,2)
-        resize1 = resize1.to(device)
-        
-        grid_identity = create_identity_grid(configs['h'], configs['w'])
-        
-        displacement_norm = torch.stack([
-                disp[:, 0, :, :] / (configs['h'] / 2),
-                disp[:, 1, :, :] / (configs['w'] / 2)
-            ], dim=-1)  
-    
-        sampling_grid = grid_identity + displacement_norm  
-    
-        image_pred = F.grid_sample(moving_imgs, sampling_grid, align_corners=True, mode='bicubic', padding_mode='border')
-        
-        image_np=image_pred[0].permute(1,2,0).detach().to("cpu").numpy()
-        image_np*=255
-        image_np=np.clip(image_np,0,255)
 
-        _loss=loss_func(image_pred,temp)
+def load_features(folder, device):
+    directory = folder / "dino_ebd"
+    tensors = [
+        torch.load(directory / f"{name}_ebd.pt", map_location=device, weights_only=True).float()
+        for name in ("fixed", "moving")
+    ]
+    fixed, moving = (value.unsqueeze(0) if value.ndim == 3 else value for value in tensors)
+    if fixed.ndim != 4 or fixed.shape != moving.shape or fixed.shape[0] != 1:
+        raise ValueError(f"{folder}: expected one equal-sized fixed/moving feature pair")
+    if min(fixed.shape[-2:]) < 2:
+        raise ValueError(f"{folder}: the feature grid needs at least two patches per axis")
 
-        loss_test.append(_loss.detach().to("cpu").item())
-        loss_val.append(loss.detach().to("cpu").item())
+    _, channels, height, width = fixed.shape
+    patches = height * width
+    components = min(256, channels, 2 * patches)
+    if components == channels:
+        return fixed, moving
 
-        image_final=Image.fromarray(np.uint8(image_np))
-        image_final.save(f"{out_path}/{index}.jpg")
+    joint = torch.cat((fixed.flatten(2), moving.flatten(2)), dim=2)[0].T
+    reduced, _ = pca_lowrank_transform(joint, components)
+    fixed, moving = reduced.T.reshape(1, components, 2, height, width).unbind(dim=2)
+    return fixed, moving
+
+
+def load_mask_pair(path, size, device):
+    cache = torch.load(path, map_location=device, weights_only=True)
+    masks = []
+    for key in ("mask1", "mask2", "bbox"):
+        value = cache[key].float()
+        if key == "bbox" and value.ndim == 2:
+            value = value.unsqueeze(0)
+        if value.ndim == 3:
+            value = value.unsqueeze(0)
+        if value.ndim != 4 or value.shape[0] != 1:
+            raise ValueError(f"{path}: {key} must have shape [1, K, H, W] or [K, H, W]")
+        masks.append(value)
+
+    fixed, moving, boxes = masks
+    if fixed.shape[1] != moving.shape[1] or boxes.shape[1] not in (1, fixed.shape[1]):
+        raise ValueError(f"{path}: mask channels must correspond to the shared prompt boxes")
+
+    fixed = F.interpolate(fixed, size=size, mode="bilinear", align_corners=True)
+    moving = F.interpolate(moving, size=size, mode="bilinear", align_corners=True)
+    boxes = F.interpolate(boxes, size=size, mode="nearest-exact").bool()
+    return fixed * boxes, moving * boxes, boxes
+
+
+def optimize_pair(fixed, moving, masks, args):
+    height, width = fixed.shape[-2:]
+    field = fixed.new_zeros((1, 2, height, width), requires_grad=True)
+    optimizer = torch.optim.Adam([field], lr=args.lr)
+    for _ in range(args.iterations):
+        optimizer.zero_grad()
+        grid = sampling_grid(field)
+        warped = warp(moving, grid)
+        confidence = spatial_cosine_similarity(warped, fixed, eta=args.confidence_threshold)
+        feature_loss = torch.linalg.vector_norm((warped - fixed) * confidence)
+        smoothness = torch.linalg.vector_norm(torch.stack((
+            torch.linalg.vector_norm(field[:, :, 1:, :] - field[:, :, :-1, :]),
+            torch.linalg.vector_norm(field[:, :, :, 1:] - field[:, :, :, :-1]),
+        )))
+        loss = feature_loss + args.smooth_weight * smoothness
+        if masks is not None:
+            fixed_masks, moving_masks, box_support = masks
+            residual = (warp(moving_masks, grid) - fixed_masks) * box_support
+            semantic_loss = torch.linalg.vector_norm(residual.flatten(2), dim=-1).sum()
+            loss = loss + args.semantic_weight * semantic_loss
+        if args.manifold_weight:
+            loss = loss + args.manifold_weight * manifold_alignment(warped, fixed, confidence)
+        loss.backward()
+        optimizer.step()
+    return field.detach()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Optimize a TFSA-REG field for each cached image pair.")
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--output", type=Path, default=Path("output"))
+    parser.add_argument("--size", type=int, nargs=2, metavar=("HEIGHT", "WIDTH"))
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--split", choices=("train", "val"), default="val")
+    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--iterations", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=1.0)
+    parser.add_argument("--confidence-threshold", type=float, default=0.25)
+    parser.add_argument("--smooth-weight", type=float, default=1.0)
+    parser.add_argument("--semantic-weight", type=float, default=10.0, help="Use 0 for mask-free pre-registration.")
+    parser.add_argument("--manifold-weight", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0, help="Seed for joint feature PCA.")
+    args = parser.parse_args()
+    if args.iterations < 1 or (args.size and min(args.size) < 2):
+        parser.error("Use at least one iteration and image axes of at least two pixels.")
+    torch.manual_seed(args.seed)
+
+    samples = registration_samples(args.data_root, prefix=args.split)[:args.limit]
+    if not samples:
+        parser.error(f"No registration samples in {args.data_root}")
+    args.output.mkdir(parents=True, exist_ok=True)
+    errors = []
+    for folder in tqdm(samples, desc="Registering"):
+        fixed, moving = load_features(folder, args.device)
+        masks = None
+        if args.semantic_weight:
+            cache = folder / "mask.pt"
+            if not cache.is_file() and "_" in folder.name:
+                cache = folder.parent / folder.name.split("_", 1)[1] / "mask.pt"
+            masks = load_mask_pair(cache, fixed.shape[-2:], args.device)
+        field = optimize_pair(fixed, moving, masks, args)
+        size = args.size or (None, None)
+        with torch.no_grad():
+            image = load_image(folder / "moving.jpg", args.device, *size)
+            height, width = image.shape[-2:]
+            feature_height, feature_width = field.shape[-2:]
+            scale = field.new_tensor(((width - 1) / (feature_width - 1), (height - 1) / (feature_height - 1)))
+            image_field = F.interpolate(field, (height, width), mode="bilinear", align_corners=True)
+            image_field = image_field * scale.view(1, 2, 1, 1)
+            registered = warp(image, sampling_grid(image_field), mode="bicubic").clamp(0, 1)
+            pixels = (registered[0] * 255).round().byte().permute(1, 2, 0).cpu().numpy()
+            Image.fromarray(pixels[:, :, 0] if pixels.shape[-1] == 1 else pixels).save(args.output / f"{folder.name}.jpg")
+
+            reference = folder / "temp.jpg"
+            if reference.is_file():
+                expected = load_image(reference, args.device, *size)
+                if expected.shape != registered.shape:
+                    raise ValueError(f"{reference}: reference shape differs from the registered image")
+                errors.append(F.mse_loss(registered, expected).item())
+    if errors:
+        print(f"Mean reference-image MSE over {len(errors)} pairs: {sum(errors) / len(errors):.6f}")
+
+
+if __name__ == "__main__":
+    main()
